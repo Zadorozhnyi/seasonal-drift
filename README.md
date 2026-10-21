@@ -72,6 +72,42 @@ Outputs in `results/`: `summary.md` (tables), `calibration.csv`,
 detector) and the figures `far_control_*.png`, `detectability_*.png`,
 `delay_*.png`, `example_series.png`.
 
+## Stream B (RQ3): reference adaptation strategies
+
+A deployed LightGBM model forecasts every day the next 24 hours (all features use values at least
+24 hours old: hour, weekday, lags 24/48/168/336, lagged daily and weekly means; yearly terms for the
+national series). Its settings were chosen on validation windows that do not overlap the test runs
+(`adapt --tune`, results in `results/adapt/tune.md`).
+
+Initial action catalog (`src/sdrift/actions.py`): do nothing, retrain on all history, retrain on the
+last 8 weeks, shorten the window to 2 weeks, reweight recent data (half-life 1 week), add a seasonal
+feature (4-week hour-of-week profile), recalibrate the forecast level on the last week. Interval
+recalibration is listed but not used until prediction intervals exist.
+
+Strategies (`src/sdrift/adapt.py`): `nothing`, `always` (retrain daily), `scheduled` (retrain weekly),
+`oracle_weekly` and `oracle` (the catalog action with the lowest error on the next week / day, chosen
+in hindsight; upper bounds, not deployable). Metrics: MASE (scaled by the weekly seasonal naive error
+on the training data) before and after the change, regret against the ideal oracle, number of
+retrainings, and the gain over `nothing` with a 95% moving block bootstrap interval over days.
+
+Data: 240 synthetic series (20 UCI clients x 3 seeds x {no change, level shift 2 sigma, one-week
+ramp 2 sigma, noise x2}, 24 weeks, deployment at week 10, change at week 13) and the national load of
+8 countries (ENTSO-E via Open Power System Data, 2017-2020, deployment 6 January 2020, the change is
+the date of the March 2020 measures).
+
+```
+python -m sdrift.cli adapt --tune          # base model validation
+python -m sdrift.cli adapt --clients 20 --seeds 3
+python -m sdrift.cli adapt --report        # rebuild tables and figures without recomputing
+```
+
+The full run takes about 40 minutes on 16 cores. Set `OMP_NUM_THREADS=1`: every process trains its own
+models, and extra threads only compete for the same cores.
+
+Outputs in `results/adapt/`: `summary.md`, `summary.csv`, `runs.csv`, `oracle_picks.csv`, `tune.md`,
+`quality_cost.png`, and the examples `example_level_shift.*` and `example_entsoe_PT.*` (forecasts
+as CSV and the figure).
+
 ## Known limitations of this MVP
 
 * The seasonal profile of the control series is constant, so the residual

@@ -13,6 +13,7 @@ dependencies = [
     "scipy",
     "statsmodels",
     "river==0.22.0",
+    "lightgbm>=4.3",
     "matplotlib",
     "pyarrow",
     "tabulate",

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -89,6 +90,104 @@ def cmd_report(args):
     print(f"report rebuilt in {out}")
 
 
+ENTSOE_FILE = Path("data/raw/opsd/time_series_60min_singleindex.csv")
+TUNE_CONFIGS = {
+    "A: 200 rounds, lr 0.05, 31 leaves": {},
+    "B: 400 rounds, lr 0.05, 63 leaves": dict(rounds=400, num_leaves=63),
+    "C: 300 rounds, lr 0.03, 15 leaves": dict(rounds=300, learning_rate=0.03, num_leaves=15),
+    "D: 200 rounds, lr 0.10, 31 leaves": dict(learning_rate=0.10),
+}
+
+
+def cmd_adapt(args):
+    """Stream B (RQ3): base model validation, reference strategies and the oracle."""
+    from .adapt import SYN_DEPLOY_WEEK, entsoe_series, run_adapt, synthetic_series, tune_base_model
+    from .evaluate import fit_models
+    from .forecast import LGBM_PARAMS, WEEK
+
+    t = time.time()
+    out = Path(args.out) / "adapt"
+    out.mkdir(parents=True, exist_ok=True)
+    cache = {}
+
+    def models():
+        if "m" not in cache:
+            cache["m"] = fit_models(Config(n_clients=args.clients))
+        return cache["m"]
+
+    real = ENTSOE_FILE.exists() and not args.no_real
+    if args.tune:
+        # validation only: other control seeds, and 2019 for ENTSO-E (the test period is 2020)
+        tune = synthetic_series(models(), [900, 901], scenarios=(("none", 0.0),))
+        for s in tune:
+            s["t_stop"] = (SYN_DEPLOY_WEEK + 6) * WEEK
+        if real:
+            tune += entsoe_series(str(ENTSOE_FILE), start="2017-01-02", deploy="2019-09-02", end="2019-12-01 23:00")
+        configs = {k: dict(LGBM_PARAMS, **v) for k, v in TUNE_CONFIGS.items()}
+        res = tune_base_model(tune, configs, args.processes)
+        res.to_csv(out / "tune.csv", index=False)
+        table = res.groupby(["source", "config"]).agg(mase=("mase", "mean"), mase_naive=("mase_naive", "mean"), series=("series", "nunique")).round(3)
+        (out / "tune.md").write_text("# Base model validation (static model, MASE)\n\n" + table.to_markdown() + "\n", encoding="utf-8")
+        print(table.to_string())
+        return
+    if not args.report:
+        # the long ENTSO-E series go first, so they run alongside the synthetic ones
+        series = (entsoe_series(str(ENTSOE_FILE)) if real else []) + synthetic_series(models(), list(range(args.seeds)))
+        runs = run_adapt(series, args.processes, log=sys.stderr)
+        runs.to_csv(out / "runs.csv", index=False)
+    runs = pd.read_csv(out / "runs.csv")
+    summ = write_adapt_report(runs, out)
+    adapt_examples(models, out, real, recompute=not args.report)
+    print(f"done in {time.time() - t:.0f} s -> {out}")
+    print(summ.round(3).to_string(index=False))
+
+
+def write_adapt_report(runs: pd.DataFrame, out: Path) -> pd.DataFrame:
+    from .adapt import oracle_picks, summarize_adapt
+    from .plots_adapt import plot_quality_cost
+
+    summ = summarize_adapt(runs)
+    summ.to_csv(out / "summary.csv", index=False)
+    picks = oracle_picks(runs)
+    picks.to_csv(out / "oracle_picks.csv", index=False)
+    lines = ["# Stream B (RQ3): reference adaptation strategies and the oracles", "",
+             "Day-ahead LightGBM forecasts, a decision about the model every day (always, oracle) or week (scheduled, oracle_weekly).",
+             "MASE is scaled by the weekly seasonal naive error on the training data. Regret = MASE after the change minus the ideal oracle's.",
+             "Retrains count deployed retrainings only (for the oracles: the chosen actions, not the trial fits).",
+             "gain_vs_nothing = MASE(do nothing) - MASE(strategy) after the change; share_gain_significant = share of series where the lower bound of the 95% moving block bootstrap interval is above 0.", "",
+             summ.round(3).to_markdown(index=False), "", "## Actions chosen by the oracles (share of decisions)", "",
+             picks.to_markdown(index=False), ""]
+    (out / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+    plot_quality_cost(summ[summ.strategy != "naive"], out / "quality_cost.png")
+    return summ
+
+
+def adapt_examples(models, out: Path, real: bool, recompute: bool):
+    """Two example series (synthetic level shift, Portugal 2020): forecasts are stored as CSV, then plotted."""
+    from .adapt import STRATEGIES, backtest, entsoe_series, synthetic_series
+    from .forecast import mase_scale
+    from .plots_adapt import example_frame, plot_adapt_example
+
+    def build(s, before, after):
+        preds = {st.name: backtest(s["y"], s["F"], s["t_deploy"], st, s["base_features"])["pred"]
+                 for st in STRATEGIES if st.name in ("nothing", "scheduled", "oracle")}
+        return example_frame(s["y"], preds, s["t_change"], mase_scale(s["y"][: s["t_deploy"]]), before, after)
+
+    csv = out / "example_level_shift.csv"
+    if recompute or not csv.exists():
+        m = max(models(), key=lambda m: m.amplitude)  # the client with the largest seasonal amplitude
+        df = build([x for x in synthetic_series([m], [0]) if x["scenario"] == "level_shift"][0], 7, 21)
+        df.insert(0, "client", m.client)
+        df.to_csv(csv, index=False)
+    df = pd.read_csv(csv)
+    plot_adapt_example(df, f"Client {df.client.iloc[0]}: level shift of 2σ, day-ahead forecasts", out / "example_level_shift.png", "load, kW")
+    if real:
+        csv = out / "example_entsoe_PT.csv"
+        if recompute or not csv.exists():
+            build(entsoe_series(str(ENTSOE_FILE), countries=("PT",))[0], 14, 35).to_csv(csv, index=False)
+        plot_adapt_example(pd.read_csv(csv), "Portugal, national load: measures of 16.03.2020, day-ahead forecasts", out / "example_entsoe_PT.png", "load, MW")
+
+
 def main():
     p = argparse.ArgumentParser(prog="sdrift")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -105,6 +204,15 @@ def main():
         if a.dest in ("clients", "seeds", "target_far", "out"):
             rp.add_argument(*a.option_strings, type=a.type, default=a.default)
     rp.set_defaults(func=cmd_report)
+    ad = sub.add_parser("adapt", help="stream B: reference adaptation strategies and the oracle")
+    ad.add_argument("--clients", type=int, default=20)
+    ad.add_argument("--seeds", type=int, default=3)
+    ad.add_argument("--processes", type=int, default=None)
+    ad.add_argument("--out", default="results")
+    ad.add_argument("--tune", action="store_true", help="validate base-model settings instead of running the strategies")
+    ad.add_argument("--no-real", action="store_true", help="skip the ENTSO-E series")
+    ad.add_argument("--report", action="store_true", help="rebuild tables and figures from results/adapt without recomputing")
+    ad.set_defaults(func=cmd_adapt)
     args = p.parse_args()
     args.func(args)
 
